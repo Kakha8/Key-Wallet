@@ -19,7 +19,8 @@ constexpr uint8_t BCRYPT_COST = 10; // Each +1 roughly doubles hashing time.
 static_assert(BCRYPT_COST >= 4 && BCRYPT_COST <= 14, "Use a cost from 4 to 14");
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
 
-enum ButtonIndex { BTN_UP, BTN_RIGHT, BTN_DOWN, BTN_LEFT, BTN_OK };
+enum ButtonIndex { BTN_UP, BTN_RIGHT, BTN_DOWN, BTN_LEFT, BTN_OK,
+                   BTN_DELETE, BTN_SUBMIT, BTN_COUNT };
 struct Button {
   uint8_t pin;
   bool lastReading, stableState;
@@ -29,12 +30,12 @@ bool buttonPressed(Button& button); // Prevent Arduino from generating this abov
 Button buttons[] = {
   {21, HIGH, HIGH, 0}, {18, HIGH, HIGH, 0},
   {17, HIGH, HIGH, 0}, {10, HIGH, HIGH, 0},
-  { 7, HIGH, HIGH, 0}
+  { 7, HIGH, HIGH, 0}, { 5, HIGH, HIGH, 0}, { 6, HIGH, HIGH, 0}
 };
 
 enum ScreenMode { CREATE_PIN, RETYPE_PIN, AUTH_PIN, UNLOCKED, FATAL_ERROR };
 ScreenMode mode = FATAL_ERROR;
-const char KEYS[] = "123456789<0>";
+const char KEYS[] = "123456789 0 "; // Empty bottom corners are not selectable.
 const char* heading = "STARTING";
 int selectedKey = 0;
 char enteredPin[7] = {}, firstPin[7] = {}, savedHash[61] = {};
@@ -97,6 +98,7 @@ void drawPinScreen() {
       if (i < pinLength) display.fillCircle(x + 5, 38, 2, SSD1306_WHITE);
     }
     for (int i = 0; i < 12; ++i) {
+      if (KEYS[i] == ' ') continue;
       int x = 76 + (i % 3) * 17, y = 17 + (i / 3) * 12;
       bool selected = i == selectedKey;
       if (selected) display.fillRoundRect(x, y, 15, 11, 2, SSD1306_WHITE);
@@ -214,17 +216,22 @@ void submitPin() {
 
 void activateSelectedKey() {
   char key = KEYS[selectedKey];
-  if (key == '<') {
-    if (pinLength) enteredPin[--pinLength] = '\0';
-    heading = entryHeading();
-  } else if (key == '>') submitPin();
-  else {
+  if (key >= '0' && key <= '9') {
     if (pinLength < 6) {
       enteredPin[pinLength++] = key;
       enteredPin[pinLength] = '\0';
     }
     heading = entryHeading();
   }
+}
+
+void moveSelection(int rowStep, int colStep) {
+  int row = selectedKey / 3, col = selectedKey % 3;
+  do {
+    row = (row + rowStep + 4) % 4;
+    col = (col + colStep + 3) % 3;
+  } while (KEYS[row * 3 + col] == ' ');
+  selectedKey = row * 3 + col;
 }
 
 void setup() {
@@ -252,8 +259,8 @@ void setup() {
 }
 
 void loop() {
-  bool pressed[5];
-  for (int i = 0; i < 5; ++i) pressed[i] = buttonPressed(buttons[i]);
+  bool pressed[BTN_COUNT];
+  for (int i = 0; i < BTN_COUNT; ++i) pressed[i] = buttonPressed(buttons[i]);
   if (mode == FATAL_ERROR) { delay(5); return; }
   if (retryWait) {
     if (millis() - retryStarted >= 3000) {
@@ -272,14 +279,20 @@ void loop() {
     }
     delay(5); return;
   }
-  int row = selectedKey / 3, col = selectedKey % 3;
   bool redraw = false;
-  if (pressed[BTN_UP])    { row = (row + 3) % 4; redraw = true; }
-  if (pressed[BTN_RIGHT]) { col = (col + 1) % 3; redraw = true; }
-  if (pressed[BTN_DOWN])  { row = (row + 1) % 4; redraw = true; }
-  if (pressed[BTN_LEFT])  { col = (col + 2) % 3; redraw = true; }
-  selectedKey = row * 3 + col;
-  if (pressed[BTN_OK]) { activateSelectedKey(); redraw = true; }
+  if (pressed[BTN_UP])    { moveSelection(-1, 0); redraw = true; }
+  if (pressed[BTN_RIGHT]) { moveSelection(0, 1); redraw = true; }
+  if (pressed[BTN_DOWN])  { moveSelection(1, 0); redraw = true; }
+  if (pressed[BTN_LEFT])  { moveSelection(0, -1); redraw = true; }
+  // Process only one entry action per scan: delete, submit, or digit selection.
+  if (pressed[BTN_DELETE]) {
+    if (pinLength) enteredPin[--pinLength] = '\0';
+    heading = entryHeading();
+    redraw = true;
+  } else if (pressed[BTN_SUBMIT]) {
+    submitPin();
+    redraw = true;
+  } else if (pressed[BTN_OK]) { activateSelectedKey(); redraw = true; }
   if (redraw) drawPinScreen();
   delay(1);
 }
