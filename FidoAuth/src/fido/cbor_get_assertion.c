@@ -90,6 +90,7 @@ err:
 }
 
 int cbor_get_assertion(const uint8_t *data, size_t len, bool next) {
+    static const uint8_t removal_marker[] = "ENIGMA_REMOVAL_V1";
     size_t resp_size = 0;
     uint64_t pinUvAuthProtocol = 0, hmacSecretPinUvAuthProtocol = 1;
     CredOptions options = { 0 };
@@ -105,6 +106,7 @@ int cbor_get_assertion(const uint8_t *data, size_t len, bool next) {
     size_t allowList_len = 0, creds_len = 0;
     uint8_t *aut_data = NULL;
     bool asserted = false, up = false, uv = false, pinUvAuthProtocol_present = false;
+    bool removal_request = false;
     int64_t kty = 2, alg = 0, crv = 0;
     CborByteString kax = { 0 }, kay = { 0 }, salt_enc = { 0 }, salt_auth = { 0 };
     const bool *credBlob = NULL;
@@ -153,6 +155,10 @@ int cbor_get_assertion(const uint8_t *data, size_t len, bool next) {
                     }
                 }
                 CBOR_PARSE_MAP_END(_f2, 3);
+                if (pc->id.present && pc->id.len == sizeof(removal_marker) - 1 &&
+                        memcmp(pc->id.data, removal_marker, sizeof(removal_marker) - 1) == 0) {
+                    removal_request = true;
+                }
                 allowList_len++;
             }
             CBOR_PARSE_ARRAY_END(_f1, 2);
@@ -215,6 +221,11 @@ int cbor_get_assertion(const uint8_t *data, size_t len, bool next) {
         }
     }
     CBOR_PARSE_MAP_END(map, 1);
+
+#ifdef ESP_PLATFORM
+    extern void wallet_ui_command(const char *command);
+    wallet_ui_command(removal_request ? "REMOVAL" : "AUTH");
+#endif
 
     if (rpId.present == false || clientDataHash.present == false) {
         CBOR_ERROR(CTAP2_ERR_MISSING_PARAMETER);

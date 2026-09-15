@@ -58,7 +58,9 @@ int cbor_parse(uint8_t cmd, const uint8_t *data, size_t len) {
 #ifdef ESP_PLATFORM
             switch (data[0]) {
                 case CTAP_MAKE_CREDENTIAL: wallet_ui_command("REGISTER"); break;
-                case CTAP_GET_ASSERTION: wallet_ui_command("AUTH"); break;
+                // cbor_get_assertion() labels this after parsing the request so
+                // application-specific removal assertions are not shown as AUTH.
+                case CTAP_GET_ASSERTION: break;
                 case CTAP_SELECTION: wallet_ui_command("SELECT"); break;
                 case CTAP_RESET: wallet_ui_command("RESET"); break;
                 case CTAP_CLIENT_PIN: wallet_ui_command("PIN COMMAND"); break;

@@ -14,6 +14,7 @@ static i2c_master_dev_handle_t oled;
 static uint8_t frame[1024];
 // Workers publish static labels; only core0 touches I2C and the framebuffer.
 static _Atomic(const char *) command = "READY";
+static _Atomic(TickType_t) removal_latched_until;
 static const char *shown_command = "READY";
 static const char *status = "READY";
 static bool waiting;
@@ -148,6 +149,7 @@ bool wallet_ui_prompt(void) {
     return render(gpio_get_level(GPIO_NUM_5), gpio_get_level(GPIO_NUM_6));
 }
 void wallet_ui_result(const char *message) {
+    atomic_store(&removal_latched_until, 0);
     waiting = false;
     result_visible = true;
     result_until = xTaskGetTickCount() + pdMS_TO_TICKS(5000);
@@ -156,6 +158,15 @@ void wallet_ui_result(const char *message) {
     previous_buttons = -1;
 }
 void wallet_ui_command(const char *name) {
+    TickType_t now = xTaskGetTickCount();
+    if (strcmp(name, "REMOVAL") == 0) {
+        // Windows may split allowCredentials across CTAP requests. Keep the
+        // removal intent while the following request carries the real key ID.
+        atomic_store(&removal_latched_until, now + pdMS_TO_TICKS(15000));
+    } else if (strcmp(name, "AUTH") == 0) {
+        TickType_t until = atomic_load(&removal_latched_until);
+        if (until != 0 && (int32_t)(until - now) > 0) return;
+    }
     atomic_store(&command, name);
 }
 void wallet_ui_task(void) {
@@ -169,6 +180,7 @@ void wallet_ui_task(void) {
         result_visible = false;
         shown_command = "READY";
         status = "READY";
+        atomic_store(&removal_latched_until, 0);
         atomic_store(&command, "READY");
         render(false, false);
         previous_buttons = pins;
