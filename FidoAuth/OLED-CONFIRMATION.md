@@ -34,10 +34,10 @@ those commands are processed. PIN SET means the request arrived, not that
 the PIN was saved successfully. Confirmation results distinguish HOST CANCEL,
 GPIO FIVE CANCEL, TIMED OUT and APPROVED.
 
-The bottom row shows OK LOW/HIGH and CANCEL LOW/HIGH (raw GPIO levels).
-With both buttons released it should say OK LOW CANCEL LOW. Press GPIO5:
-OK HIGH CANCEL LOW. Release it: OK LOW CANCEL LOW. Test GPIO6 likewise.
-This test works while idle and does not create or delete credentials.
+During confirmation, OK and CANCEL appear as outlined on-screen buttons.
+Pressing the matching physical button fills its rectangle and reverses the
+label color. The idle screen only shows KEY WALLET and READY; raw GPIO and
+diagnostic text are hidden.
 
 APPROVED means physical consent was given; the browser/server still
 decides whether enrollment or authentication succeeded.
