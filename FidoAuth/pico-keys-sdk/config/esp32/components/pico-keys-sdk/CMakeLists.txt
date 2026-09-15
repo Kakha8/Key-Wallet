@@ -17,6 +17,7 @@ set(PICOKEYS_REQUIRES
     efuse
     mbedtls
     esp_driver_i2c
+    nvs_flash
 )
 if(USB_ITF_HID)
     list(APPEND PICOKEYS_REQUIRES
@@ -49,7 +50,7 @@ if(ENABLE_PQC)
 endif()
 
 idf_component_register(
-    SRCS ${PICOKEYS_SOURCES} ${PICOKEYS_SDK_DIR}/src/wallet_ui.c
+    SRCS ${PICOKEYS_SOURCES} ${PICOKEYS_SDK_DIR}/src/wallet_ui.c ${PICOKEYS_SDK_DIR}/src/crypt_blowfish.c
     INCLUDE_DIRS ${PICOKEYS_INCLUDE_DIRS}
     REQUIRES ${PICOKEYS_REQUIRES}
 )

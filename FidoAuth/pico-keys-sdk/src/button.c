@@ -165,6 +165,10 @@ void button_wait_poll(void) {
     bool pressed = picok_board_button_read();
     uint32_t now = board_millis();
 #ifdef ESP_PLATFORM
+    int local_authorization = wallet_ui_take_local_authorization();
+    if (local_authorization == 0) return;
+    if (local_authorization < 0) cancel_button = true;
+    else { async_button_pressed = true; pressed = false; }
     if (pressed != approve_raw) {
         approve_raw = pressed;
         approve_changed = now;
