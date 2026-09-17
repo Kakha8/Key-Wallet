@@ -160,6 +160,9 @@ int app_main(void) {
 int main(void) {
 #endif
 
+#ifdef ESP_PLATFORM
+    wallet_ui_reset_on_boot();
+#endif
     serial_init();
 
 #ifndef ENABLE_EMULATION
