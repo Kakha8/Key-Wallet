@@ -20,7 +20,21 @@
 #include "crypt_blowfish.h"
 
 static i2c_master_dev_handle_t oled;
+static i2c_master_dev_handle_t rtc;
 static uint8_t frame[1024];
+typedef struct {
+    uint32_t version;
+    uint32_t failures;
+    uint64_t locked_until;
+    uint64_t last_seen;
+} pin_lock_record_t;
+static pin_lock_record_t pin_lock;
+static bool pin_lock_storage_ok = true;
+static char pin_lock_message[24];
+static TickType_t pin_lock_checked_at;
+static bool pin_lock_back_previous;
+typedef enum { PIN_GATE_READY, PIN_GATE_WAIT, PIN_GATE_RTC_ERROR, PIN_GATE_FLASH_ERROR } pin_gate_t;
+static pin_gate_t pin_gate;
 // Workers publish static labels; only core0 touches I2C and the framebuffer.
 static _Atomic(const char *) command = "READY";
 static _Atomic(TickType_t) removal_latched_until;
@@ -221,6 +235,89 @@ static const char *pin_title(void) {
     if (strcmp(shown_command, "REMOVAL") == 0) return "REMOVE DEVICE";
     return "AUTH PIN";
 }
+static bool pin_requires_verification(void) {
+    return pin_mode == PIN_VERIFY || pin_mode == PIN_CHANGE_CURRENT ||
+           pin_mode == PIN_RESET_VERIFY;
+}
+static bool bcd_read(uint8_t encoded, unsigned maximum, unsigned *value) {
+    unsigned high = encoded >> 4, low = encoded & 15;
+    if (high > 9 || low > 9 || high * 10 + low > maximum) return false;
+    *value = high * 10 + low;
+    return true;
+}
+static bool leap_year(unsigned year) {
+    return year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+}
+static bool rtc_seconds(uint64_t *seconds) {
+    if (!rtc) return false;
+    uint8_t reg = 0x0f, status_byte = 0, raw[7] = {0};
+    if (i2c_master_transmit_receive(rtc, &reg, 1, &status_byte, 1, 50) != ESP_OK ||
+            (status_byte & 0x80)) return false; // DS3231 oscillator-stop flag.
+    reg = 0;
+    if (i2c_master_transmit_receive(rtc, &reg, 1, raw, sizeof(raw), 50) != ESP_OK) return false;
+    unsigned sec, min, hour, day, month, year;
+    if (!bcd_read(raw[0] & 0x7f, 59, &sec) ||
+            !bcd_read(raw[1] & 0x7f, 59, &min) ||
+            !bcd_read(raw[4] & 0x3f, 31, &day) ||
+            !bcd_read(raw[5] & 0x1f, 12, &month) ||
+            !bcd_read(raw[6], 99, &year) || (raw[5] & 0x80)) return false;
+    if (raw[2] & 0x40) {
+        if (!bcd_read(raw[2] & 0x1f, 12, &hour) || hour == 0) return false;
+        hour = (hour % 12) + ((raw[2] & 0x20) ? 12 : 0);
+    } else if (!bcd_read(raw[2] & 0x3f, 23, &hour)) return false;
+    year += 2000;
+    if (year < 2020 || month == 0 || day == 0) return false;
+    static const uint8_t days_in_month[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    unsigned days_this_month = days_in_month[month - 1] + (month == 2 && leap_year(year));
+    if (day > days_this_month) return false;
+    uint64_t days = 0;
+    for (unsigned y = 2000; y < year; ++y) days += leap_year(y) ? 366 : 365;
+    for (unsigned m = 1; m < month; ++m)
+        days += days_in_month[m - 1] + (m == 2 && leap_year(year));
+    days += day - 1;
+    *seconds = ((days * 24 + hour) * 60 + min) * 60 + sec;
+    return true;
+}
+static bool pin_lock_store(const pin_lock_record_t *record) {
+    if (!pin_lock_storage_ok || !pin_store_open ||
+            nvs_set_blob(pin_nvs, "pin-lock", record, sizeof(*record)) != ESP_OK ||
+            nvs_commit(pin_nvs) != ESP_OK) {
+        pin_lock_storage_ok = false;
+        return false;
+    }
+    pin_lock = *record;
+    return true;
+}
+static pin_gate_t pin_lock_check(uint64_t *now_out) {
+    if (!pin_lock_storage_ok || !pin_store_open) return PIN_GATE_FLASH_ERROR;
+    uint64_t now;
+    if (!rtc_seconds(&now) || now < pin_lock.last_seen) return PIN_GATE_RTC_ERROR;
+    if (now_out) *now_out = now;
+    if (pin_lock.locked_until > now) {
+        uint64_t remaining = pin_lock.locked_until - now;
+        snprintf(pin_lock_message, sizeof(pin_lock_message), "WAIT %02lu:%02lu",
+                 (unsigned long)(remaining / 60), (unsigned long)(remaining % 60));
+        return PIN_GATE_WAIT;
+    }
+    return PIN_GATE_READY;
+}
+static bool pin_lock_record_result(bool correct, uint64_t now) {
+    pin_lock_record_t next = pin_lock;
+    next.version = 1;
+    next.last_seen = now;
+    if (correct) {
+        next.failures = 0;
+        next.locked_until = 0;
+    } else {
+        if (next.failures < UINT32_MAX) ++next.failures;
+        uint64_t delay = next.failures == 5 ? 30 :
+                         next.failures == 6 ? 120 :
+                         next.failures == 7 ? 600 :
+                         next.failures >= 8 ? 3600 : 0;
+        next.locked_until = delay ? now + delay : 0;
+    }
+    return pin_lock_store(&next);
+}
 static const char *settings_items[3] = {"DEVICE INFO", "CHANGE PIN", "RESET DEVICE"};
 static void render_device_info(bool back_pressed, bool next_pressed) {
     char id_label[16];
@@ -256,6 +353,11 @@ static bool render(bool ok_pressed, bool cancel_pressed) {
     if (reset_success_visible) {
         centered(20, "DEVICE SUCCESSFULLY", true);
         centered(34, "RESET", true);
+    } else if (pin_requires_verification() && pin_gate != PIN_GATE_READY) {
+        centered(12, pin_gate == PIN_GATE_WAIT ? "PIN LOCKED" :
+                     pin_gate == PIN_GATE_RTC_ERROR ? "RTC ERROR" : "FLASH ERROR", true);
+        if (pin_gate == PIN_GATE_WAIT) centered(30, pin_lock_message, true);
+        pin_button(38, 52, "BACK", !gpio_get_level(GPIO_NUM_5));
     } else if (pin_mode != PIN_IDLE) {
         centered(1, pin_title(), true);
         unsigned entry_slots = pin_mode == PIN_RESET_CHALLENGE ? 4 : 6;
@@ -378,6 +480,16 @@ void wallet_ui_init(void) {
         oled = NULL;
         return;
     }
+    i2c_master_bus_config_t rtc_bus_config = {.i2c_port=I2C_NUM_1,
+        .sda_io_num=GPIO_NUM_8,.scl_io_num=GPIO_NUM_9,
+        .clk_source=I2C_CLK_SRC_DEFAULT,.glitch_ignore_cnt=7,
+        .flags.enable_internal_pullup=true};
+    i2c_master_bus_handle_t rtc_bus;
+    if (i2c_new_master_bus(&rtc_bus_config, &rtc_bus) == ESP_OK) {
+        i2c_device_config_t rtc_config = {.dev_addr_length=I2C_ADDR_BIT_LEN_7,
+            .device_address=0x68,.scl_speed_hz=100000};
+        if (i2c_master_bus_add_device(rtc_bus, &rtc_config, &rtc) != ESP_OK) rtc = NULL;
+    }
     esp_err_t nvs_result = nvs_flash_init();
     if (nvs_result == ESP_OK && nvs_open("device-pin", NVS_READWRITE, &pin_nvs) == ESP_OK) {
         pin_store_open = true;
@@ -389,6 +501,11 @@ void wallet_ui_init(void) {
         }
         size_t size = sizeof(pin_hash);
         if (nvs_get_str(pin_nvs, "bcrypt", pin_hash, &size) != ESP_OK || size != sizeof(pin_hash)) pin_hash[0] = 0;
+        size_t lock_size = sizeof(pin_lock);
+        esp_err_t lock_result = nvs_get_blob(pin_nvs, "pin-lock", &pin_lock, &lock_size);
+        if (lock_result == ESP_ERR_NVS_NOT_FOUND) pin_lock.version = 1;
+        else if (lock_result != ESP_OK || lock_size != sizeof(pin_lock) || pin_lock.version != 1)
+            pin_lock_storage_ok = false;
         if (nvs_get_u32(pin_nvs, "device-id", &device_info_id) != ESP_OK || device_info_id == 0) {
             device_info_id = esp_random();
             if (device_info_id == 0) device_info_id = 1;
@@ -421,6 +538,8 @@ bool wallet_ui_prompt(void) {
     mbedtls_platform_zeroize(pin_first, sizeof(pin_first));
     pin_length = 0; selected_key = 0; pin_notice = NULL;
     pin_mode = pin_hash[0] ? PIN_VERIFY : PIN_CREATE;
+    pin_lock_checked_at = 0;
+    pin_lock_back_previous = false;
     pin_back_down = false;
     pin_back_cancelled = false;
     pin_previous_buttons = -1;
@@ -476,6 +595,7 @@ static void pin_submit(void) {
         if (matched) {
             pin_mode = PIN_RESET_VERIFY;
             pin_notice = NULL;
+            pin_lock_checked_at = 0;
         }
         return;
     }
@@ -531,10 +651,28 @@ static void pin_submit(void) {
         render(false, false);
         return;
     }
+    uint64_t rtc_now = 0;
+    pin_gate = pin_lock_check(&rtc_now);
+    if (pin_gate != PIN_GATE_READY) {
+        pin_clear();
+        return;
+    }
     char candidate[61] = {0};
     bool computed = pin_calculate(pin_entry, pin_hash, candidate);
     bool ok = computed && pin_hash_matches(candidate, pin_hash);
     mbedtls_platform_zeroize(candidate,sizeof(candidate)); pin_clear();
+    if (!computed) {
+        pin_lock_storage_ok = false;
+        pin_gate = PIN_GATE_FLASH_ERROR;
+        pin_notice = "HASH ERROR";
+        return;
+    }
+    if (!pin_lock_record_result(ok, rtc_now)) {
+        pin_gate = PIN_GATE_FLASH_ERROR;
+        pin_notice = "FLASH ERROR";
+        return;
+    }
+    pin_gate = pin_lock_check(NULL);
     if (pin_mode == PIN_CHANGE_CURRENT) {
         if (ok) {
             pin_mode = PIN_CHANGE_NEW;
@@ -563,7 +701,8 @@ static void pin_submit(void) {
         esp_restart();
         return;
     }
-    if (ok) { pin_mode=PIN_IDLE; local_auth_result=1; } 
+    if (ok) { pin_mode=PIN_IDLE; local_auth_result=1; pin_notice=NULL; }
+    else pin_notice = "WRONG PIN";
 }
 int wallet_ui_take_local_authorization(void) { int r=local_auth_result; if (r) local_auth_result=0; return r; }
 void wallet_ui_result(const char *message) {
@@ -607,6 +746,40 @@ void wallet_ui_task(void) {
             render(false, false);
         }
         return;
+    }
+    if (pin_requires_verification()) {
+        bool refreshed = pin_lock_checked_at == 0 ||
+                         (TickType_t)(now - pin_lock_checked_at) >= pdMS_TO_TICKS(1000);
+        if (refreshed) {
+            pin_gate_t previous_gate = pin_gate;
+            pin_gate = pin_lock_check(NULL);
+            pin_lock_checked_at = now;
+            if (previous_gate != PIN_GATE_READY && pin_gate == PIN_GATE_READY)
+                pin_notice = NULL;
+        }
+        if (pin_gate != PIN_GATE_READY) {
+            bool back = !gpio_get_level(GPIO_NUM_5);
+            if (back && !pin_lock_back_previous) {
+                pin_clear();
+                pin_notice = NULL;
+                pin_mode = PIN_IDLE;
+                if (settings_open) {
+                    settings_detail_open = false;
+                    settings_change_confirm = false;
+                    settings_reset_confirm = false;
+                    suppress_settings_back_release = true;
+                } else local_auth_result = -1;
+                previous_buttons = -1;
+                render(false, false);
+                pin_lock_back_previous = back;
+                return;
+            }
+            if (refreshed || back != pin_lock_back_previous) render(false, false);
+            pin_lock_back_previous = back;
+            return;
+        }
+        if (refreshed) render(false, false);
+        pin_lock_back_previous = false;
     }
     if (pin_mode != PIN_IDLE) {
         int p = (!gpio_get_level(GPIO_NUM_21)?1:0)|(!gpio_get_level(GPIO_NUM_18)?2:0)|(!gpio_get_level(GPIO_NUM_17)?4:0)|(!gpio_get_level(GPIO_NUM_10)?8:0)|(!gpio_get_level(GPIO_NUM_7)?16:0)|(!gpio_get_level(GPIO_NUM_5)?32:0)|(!gpio_get_level(GPIO_NUM_6)?64:0);
@@ -721,6 +894,7 @@ void wallet_ui_task(void) {
             } else if (settings_change_confirm && !(pins & 16) && (previous_buttons & 16)) {
                 settings_change_confirm = false;
                 pin_mode = PIN_CHANGE_CURRENT;
+                pin_lock_checked_at = 0;
                 pin_notice = NULL;
                 pin_clear();
                 mbedtls_platform_zeroize(pin_first, sizeof(pin_first));
