@@ -1,0 +1,8 @@
+build*/
+*__pycache__*
+legacy/
+.DS_Store
+managed_components/
+pico-keys-sdk/third-party/
+sdkconfig.old
+
